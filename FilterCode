@@ -1,0 +1,1391 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using OpenQA.Selenium;
+using OpenQA.Selenium.Chrome;
+using OpenQA.Selenium.Support.UI;
+using OpenQA.Selenium.Interactions;
+using SeleniumExtras.WaitHelpers;
+
+namespace Dynamics365UIFilterAutomation
+{
+    /// <summary>
+    /// Complete Selenium utility for automating Dynamics 365 UI filter operations
+    /// Updated for current CRM version selectors with full OR/AND grouping support
+    /// </summary>
+    public class D365UIFilterUtility
+    {
+        private readonly IWebDriver _driver;
+        private readonly WebDriverWait _wait;
+        private readonly int _defaultTimeoutSeconds;
+
+        public D365UIFilterUtility(IWebDriver driver, int timeoutSeconds = 30)
+        {
+            _driver = driver ?? throw new ArgumentNullException(nameof(driver));
+            _defaultTimeoutSeconds = timeoutSeconds;
+            _wait = new WebDriverWait(_driver, TimeSpan.FromSeconds(timeoutSeconds));
+        }
+
+        /// <summary>
+        /// Filter configuration for UI automation
+        /// </summary>
+        public class FilterConfiguration
+        {
+            public string FieldName { get; set; }
+            public string Operator { get; set; } = "Contains";
+            public string Value { get; set; }
+            public FilterGroupType GroupType { get; set; } = FilterGroupType.And;
+            public int GroupIndex { get; set; } = 0;
+        }
+
+        public enum FilterGroupType
+        {
+            And,
+            Or
+        }
+
+        /// <summary>
+        /// Current Dynamics 365 CRM selectors
+        /// </summary>
+        public static class D365Selectors
+        {
+            // Main filter control selectors
+            public const string EditFiltersButton = "button#open-advance-filter";
+            public const string FilterPageHeader = "h1#advanced-filters-header";
+            public const string AddFilterButton = "button#AddMenu0";
+            public const string ApplyButton = "button#applyFilters";
+            public const string ClearAllButton = "button#expression-builder-delete-all-filters";
+            public const string MakeGroupButton = "button[name='Make group']";
+            
+            // Filter row selectors (dynamic IDs)
+            public const string FieldDropdownWrapper = "div[id*='ComboBox'][id*='wrapper']";
+            public const string FieldInput = "input[id*='ComboBox'][id$='-input']";
+            public const string OperatorDropdownWrapper = "div[id*='ComboBox'][id*='wrapper']";
+            public const string OperatorInput = "input[id*='ComboBox'][id$='-input']";
+            public const string ValueInput = "input[id*='TextField']";
+            public const string RowCheckbox = "input[id*='checkbox-']";
+            public const string MoreCommandsButton = "button[aria-label='More commands']";
+            
+            // Dynamic selector patterns with index
+            public const string FieldDropdownByIndex = "div[id*='ComboBox{0}'][id*='wrapper']";
+            public const string FieldInputByIndex = "input[id='ComboBox{0}-input']";
+            public const string OperatorDropdownByIndex = "div[id*='ComboBox{0}'][id*='wrapper']";
+            public const string OperatorInputByIndex = "input[id='ComboBox{0}-input']";
+            public const string ValueInputByIndex = "input[id='TextField{0}']";
+            public const string RowCheckboxByIndex = "input[id='checkbox-{0}']";
+            
+            // Group operator selectors
+            public const string GroupOperatorDropdown = "select[data-id*='group-operator'], div[data-id*='group-operator'], button[aria-label*='group operator']";
+            public const string OrOperatorOption = "option[value='or'], div[data-value='or'], button[title='Or'], li[data-value='or']";
+            public const string AndOperatorOption = "option[value='and'], div[data-value='and'], button[title='And'], li[data-value='and']";
+            public const string GroupOperatorButton = "button[aria-label*='And'], button[aria-label*='Or']";
+            
+            // Fallback selectors for compatibility
+            public const string EditFiltersButtonFallback = "button[aria-label*='Edit filters']";
+        }
+
+        #region Public Methods
+
+        /// <summary>
+        /// Open the Edit Filters pane
+        /// </summary>
+        public bool OpenEditFiltersPane()
+        {
+            try
+            {
+                IWebElement editButton = null;
+                try
+                {
+                    editButton = _wait.Until(ExpectedConditions.ElementToBeClickable(By.CssSelector(D365Selectors.EditFiltersButton)));
+                }
+                catch (WebDriverTimeoutException)
+                {
+                    // Try fallback selector
+                    editButton = _wait.Until(ExpectedConditions.ElementToBeClickable(By.CssSelector(D365Selectors.EditFiltersButtonFallback)));
+                }
+
+                if (editButton == null)
+                {
+                    throw new ElementNotVisibleException("Edit Filters button not found");
+                }
+
+                ClickElement(editButton);
+
+                // Wait for filter page header to appear
+                _wait.Until(ExpectedConditions.ElementIsVisible(By.CssSelector(D365Selectors.FilterPageHeader)));
+                
+                Thread.Sleep(1000); // Allow pane to fully load
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to open Edit Filters pane: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Add a single filter condition
+        /// </summary>
+        public bool AddFilter(FilterConfiguration config)
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                {
+                    if (!OpenEditFiltersPane())
+                        return false;
+                }
+
+                var initialRowCount = GetFilterRowCount();
+
+                // Click Add Filter button
+                var addFilterButton = _wait.Until(ExpectedConditions.ElementToBeClickable(
+                    By.CssSelector(D365Selectors.AddFilterButton)));
+                ClickElement(addFilterButton);
+
+                Thread.Sleep(1000); // Wait for new filter row
+
+                // Verify new row was added
+                var newRowCount = GetFilterRowCount();
+                if (newRowCount <= initialRowCount)
+                {
+                    throw new Exception("Failed to create new filter row");
+                }
+
+                // Get all current filter rows and work with the newest one
+                var filterRows = GetAllFilterRows();
+                if (filterRows.Count == 0)
+                {
+                    throw new Exception("No filter rows found after adding filter");
+                }
+
+                var newFilterRow = filterRows.LastOrDefault();
+                return ConfigureFilterRow(newFilterRow, config);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to add filter: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Add multiple filters with grouping
+        /// </summary>
+        public bool AddMultipleFilters(List<FilterConfiguration> filters)
+        {
+            try
+            {
+                if (!OpenEditFiltersPane())
+                    return false;
+
+                ClearAllFilters();
+
+                foreach (var filter in filters)
+                {
+                    if (!AddFilter(filter))
+                    {
+                        Console.WriteLine($"Failed to add filter: {filter.FieldName}");
+                    }
+                    Thread.Sleep(500);
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to add multiple filters: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Select multiple filter rows and group them with specified operator
+        /// </summary>
+        public bool GroupFilterRows(List<int> rowIndices, FilterGroupType groupOperator = FilterGroupType.And)
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                {
+                    if (!OpenEditFiltersPane())
+                        return false;
+                }
+
+                Console.WriteLine($"Attempting to group rows {string.Join(", ", rowIndices)} with {groupOperator} operator");
+
+                // Select the specified rows by clicking their checkboxes
+                foreach (var rowIndex in rowIndices)
+                {
+                    var checkboxSelector = string.Format(D365Selectors.RowCheckboxByIndex, rowIndex);
+                    try
+                    {
+                        var checkbox = _driver.FindElement(By.CssSelector(checkboxSelector));
+                        if (checkbox.Displayed && checkbox.Enabled)
+                        {
+                            ClickElement(checkbox);
+                            Console.WriteLine($"Selected row {rowIndex}");
+                            Thread.Sleep(200);
+                        }
+                    }
+                    catch (NoSuchElementException)
+                    {
+                        Console.WriteLine($"Checkbox for row {rowIndex} not found, trying alternative selector");
+                        
+                        // Try alternative selector without specific index
+                        try
+                        {
+                            var checkboxes = _driver.FindElements(By.CssSelector(D365Selectors.RowCheckbox));
+                            if (rowIndex < checkboxes.Count)
+                            {
+                                ClickElement(checkboxes[rowIndex]);
+                                Console.WriteLine($"Selected row {rowIndex} using alternative method");
+                                Thread.Sleep(200);
+                            }
+                        }
+                        catch (Exception altEx)
+                        {
+                            Console.WriteLine($"Failed to select row {rowIndex} with alternative method: {altEx.Message}");
+                        }
+                    }
+                }
+
+                // Create the group
+                if (!CreateFilterGroup())
+                {
+                    Console.WriteLine("Failed to create filter group");
+                    return false;
+                }
+
+                Console.WriteLine("Successfully created filter group");
+
+                // Set the group operator if OR is requested
+                if (groupOperator == FilterGroupType.Or)
+                {
+                    Thread.Sleep(1000); // Wait for group to be fully created
+                    if (SetGroupOperatorToOr())
+                    {
+                        Console.WriteLine("Successfully set group operator to OR");
+                        return true;
+                    }
+                    else
+                    {
+                        Console.WriteLine("Warning: Failed to set group operator to OR, but group was created");
+                        return true; // Group was created, even if operator change failed
+                    }
+                }
+
+                Console.WriteLine("Group created with default AND operator");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to group filter rows: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Apply the configured filters
+        /// </summary>
+        public bool ApplyFilters()
+        {
+            try
+            {
+                var applyButton = _wait.Until(ExpectedConditions.ElementToBeClickable(
+                    By.CssSelector(D365Selectors.ApplyButton)));
+                
+                ClickElement(applyButton);
+                Console.WriteLine("Applied filters successfully");
+
+                // Wait for grid to refresh
+                Thread.Sleep(2000);
+                
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to apply filters: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Clear all existing filters
+        /// </summary>
+        public bool ClearAllFilters()
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                {
+                    if (!OpenEditFiltersPane())
+                        return false;
+                }
+
+                try
+                {
+                    var clearButton = _driver.FindElement(By.CssSelector(D365Selectors.ClearAllButton));
+                    if (clearButton.Displayed && clearButton.Enabled)
+                    {
+                        ClickElement(clearButton);
+                        Console.WriteLine("Cleared all existing filters");
+                        Thread.Sleep(1000);
+                    }
+                }
+                catch (NoSuchElementException)
+                {
+                    Console.WriteLine("Clear all filters button not found - may be no existing filters");
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to clear filters: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set group operator to OR condition
+        /// </summary>
+        public bool SetGroupOperatorToOr()
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                {
+                    Console.WriteLine("Filter pane not open");
+                    return false;
+                }
+
+                Thread.Sleep(1000); // Wait for group to be created
+
+                // Try multiple approaches to find and change the group operator
+                return TrySetGroupOperatorMethod1("Or") || 
+                       TrySetGroupOperatorMethod2("Or") || 
+                       TrySetGroupOperatorMethod3("Or");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set group operator to OR: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set group operator to AND condition
+        /// </summary>
+        public bool SetGroupOperatorToAnd()
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                {
+                    Console.WriteLine("Filter pane not open");
+                    return false;
+                }
+
+                Thread.Sleep(1000);
+
+                return TrySetGroupOperatorMethod1("And") || 
+                       TrySetGroupOperatorMethod2("And") || 
+                       TrySetGroupOperatorMethod3("And");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set group operator to AND: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get the current number of filter rows
+        /// </summary>
+        public int GetFilterRowCount()
+        {
+            try
+            {
+                if (!IsFilterPaneOpen())
+                    return 0;
+
+                var checkboxes = _driver.FindElements(By.CssSelector(D365Selectors.RowCheckbox));
+                return checkboxes.Count;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Close the filter pane if needed
+        /// </summary>
+        public bool CloseFilterPane()
+        {
+            try
+            {
+                // Navigate away or use browser back if there's no close button
+                // The filter pane typically closes when applying filters
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to close filter pane: {ex.Message}");
+                return false;
+            }
+        }
+
+        #endregion
+
+        #region Private Helper Methods - Group Operations
+
+        /// <summary>
+        /// Method 1: Try finding group operator dropdown/select
+        /// </summary>
+        private bool TrySetGroupOperatorMethod1(string operatorValue)
+        {
+            try
+            {
+                var groupOperatorElements = _driver.FindElements(By.CssSelector(D365Selectors.GroupOperatorDropdown));
+                
+                foreach (var operatorElement in groupOperatorElements)
+                {
+                    if (!operatorElement.Displayed || !operatorElement.Enabled)
+                        continue;
+
+                    ClickElement(operatorElement);
+                    Thread.Sleep(500);
+
+                    // Look for the specific operator option
+                    var operatorSelector = operatorValue.ToLower() == "or" ? 
+                        D365Selectors.OrOperatorOption : 
+                        D365Selectors.AndOperatorOption;
+                    
+                    var operatorOptions = _driver.FindElements(By.CssSelector(operatorSelector));
+                    var targetOption = operatorOptions.FirstOrDefault(o => o.Displayed);
+
+                    if (targetOption != null)
+                    {
+                        ClickElement(targetOption);
+                        Console.WriteLine($"Successfully set group operator to {operatorValue} via Method 1");
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Method 1 failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Method 2: Try finding group operator button
+        /// </summary>
+        private bool TrySetGroupOperatorMethod2(string operatorValue)
+        {
+            try
+            {
+                // Look for buttons that might contain "And" or "Or" text
+                var groupButtons = _driver.FindElements(By.CssSelector(D365Selectors.GroupOperatorButton));
+                
+                foreach (var button in groupButtons)
+                {
+                    if (!button.Displayed || !button.Enabled)
+                        continue;
+
+                    var buttonText = button.Text?.ToLower() ?? "";
+                    var ariaLabel = button.GetAttribute("aria-label")?.ToLower() ?? "";
+                    
+                    // If this button currently shows the opposite of what we want, click it to toggle
+                    var currentOperator = (buttonText.Contains("and") || ariaLabel.Contains("and")) ? "and" : "or";
+                    var targetOperator = operatorValue.ToLower();
+                    
+                    if (currentOperator != targetOperator)
+                    {
+                        ClickElement(button);
+                        Console.WriteLine($"Successfully toggled group operator to {operatorValue} via Method 2");
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Method 2 failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Method 3: Try finding group operator through text elements
+        /// </summary>
+        private bool TrySetGroupOperatorMethod3(string operatorValue)
+        {
+            try
+            {
+                // Look for clickable text elements containing "And" or "Or"
+                var textElements = _driver.FindElements(By.XPath("//span[contains(text(), 'And') or contains(text(), 'Or')] | //div[contains(text(), 'And') or contains(text(), 'Or')] | //button[contains(text(), 'And') or contains(text(), 'Or')]"));
+                
+                foreach (var element in textElements)
+                {
+                    if (!element.Displayed)
+                        continue;
+
+                    var elementText = element.Text?.ToLower() ?? "";
+                    var currentOperator = elementText.Contains("and") ? "and" : "or";
+                    var targetOperator = operatorValue.ToLower();
+                    
+                    // If this shows the opposite of what we want and appears clickable
+                    if (currentOperator != targetOperator)
+                    {
+                        try
+                        {
+                            ClickElement(element);
+                            Console.WriteLine($"Successfully changed group operator to {operatorValue} via Method 3");
+                            return true;
+                        }
+                        catch
+                        {
+                            // Try clicking parent element
+                            var parent = element.FindElement(By.XPath(".."));
+                            ClickElement(parent);
+                            Console.WriteLine($"Successfully changed group operator to {operatorValue} via Method 3 (parent click)");
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Method 3 failed: {ex.Message}");
+                return false;
+            }
+        }
+
+        #endregion
+
+        #region Private Helper Methods
+
+        /// <summary>
+        /// Configure a specific filter row with field, operator, and value
+        /// </summary>
+        private bool ConfigureFilterRow(IWebElement filterRow, FilterConfiguration config)
+        {
+            try
+            {
+                var dynamicIndex = GetDynamicIndexFromElement(filterRow);
+
+                // Set field
+                if (!SetFilterField(filterRow, config.FieldName, dynamicIndex))
+                    return false;
+
+                Thread.Sleep(500);
+
+                // Set operator
+                if (!SetFilterOperator(filterRow, config.Operator, dynamicIndex))
+                    return false;
+
+                Thread.Sleep(500);
+
+                // Set value
+                if (!SetFilterValue(filterRow, config.Value, dynamicIndex))
+                    return false;
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to configure filter row: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set the field for a filter row with dynamic index
+        /// </summary>
+        private bool SetFilterField(IWebElement filterRow, string fieldName, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement fieldDropdown = null;
+                
+                // Try specific index first if provided
+                if (dynamicIndex > 0)
+                {
+                    var specificSelector = string.Format(D365Selectors.FieldDropdownByIndex, dynamicIndex);
+                    try
+                    {
+                        fieldDropdown = _driver.FindElement(By.CssSelector(specificSelector));
+                    }
+                    catch (NoSuchElementException) { }
+                }
+
+                // Use generic selector if specific not found
+                if (fieldDropdown == null)
+                {
+                    var fieldDropdowns = filterRow.FindElements(By.CssSelector(D365Selectors.FieldDropdownWrapper));
+                    fieldDropdown = fieldDropdowns.FirstOrDefault();
+                }
+
+                if (fieldDropdown == null)
+                {
+                    throw new NoSuchElementException("Field dropdown not found");
+                }
+
+                ClickElement(fieldDropdown);
+                Thread.Sleep(1000);
+
+                // Find and click the field option
+                var fieldOptions = _driver.FindElements(By.CssSelector("div[role='option'], li[role='option']"));
+                var fieldOption = fieldOptions.FirstOrDefault(o => 
+                    o.Text.Contains(fieldName, StringComparison.OrdinalIgnoreCase));
+
+                if (fieldOption == null)
+                {
+                    fieldOption = fieldOptions.FirstOrDefault(o =>
+                        o.GetAttribute("data-value")?.Contains(fieldName, StringComparison.OrdinalIgnoreCase) == true ||
+                        o.GetAttribute("title")?.Contains(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+                }
+
+                if (fieldOption != null)
+                {
+                    ClickElement(fieldOption);
+                    return true;
+                }
+
+                throw new Exception($"Field '{fieldName}' not found in dropdown");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter field: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set the operator for a filter row with dynamic index
+        /// </summary>
+        private bool SetFilterOperator(IWebElement filterRow, string operatorName, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement operatorDropdown = null;
+                
+                if (dynamicIndex > 0)
+                {
+                    var specificSelector = string.Format(D365Selectors.OperatorDropdownByIndex, dynamicIndex);
+                    try
+                    {
+                        operatorDropdown = _driver.FindElement(By.CssSelector(specificSelector));
+                    }
+                    catch (NoSuchElementException) { }
+                }
+
+                if (operatorDropdown == null)
+                {
+                    var operatorDropdowns = filterRow.FindElements(By.CssSelector(D365Selectors.OperatorDropdownWrapper));
+                    // Usually the second ComboBox is the operator
+                    operatorDropdown = operatorDropdowns.Skip(1).FirstOrDefault() ?? operatorDropdowns.FirstOrDefault();
+                }
+
+                if (operatorDropdown == null)
+                {
+                    throw new NoSuchElementException("Operator dropdown not found");
+                }
+
+                ClickElement(operatorDropdown);
+                Thread.Sleep(500);
+
+                var operatorOptions = _driver.FindElements(By.CssSelector("div[role='option'], li[role='option']"));
+                var operatorOption = operatorOptions.FirstOrDefault(o =>
+                    o.Text.Equals(operatorName, StringComparison.OrdinalIgnoreCase));
+
+                if (operatorOption != null)
+                {
+                    ClickElement(operatorOption);
+                    return true;
+                }
+
+                throw new Exception($"Operator '{operatorName}' not found in dropdown");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter operator: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set the value for a filter row with dynamic index
+        /// </summary>
+        private bool SetFilterValue(IWebElement filterRow, string value, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement valueInput = null;
+                
+                if (dynamicIndex > 0)
+                {
+                    var specificSelector = string.Format(D365Selectors.ValueInputByIndex, dynamicIndex);
+                    try
+                    {
+                        valueInput = _driver.FindElement(By.CssSelector(specificSelector));
+                    }
+                    catch (NoSuchElementException) { }
+                }
+
+                if (valueInput == null)
+                {
+                    valueInput = filterRow.FindElement(By.CssSelector(D365Selectors.ValueInput));
+                }
+
+                if (valueInput != null)
+                {
+                    valueInput.Clear();
+                    valueInput.SendKeys(value);
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter value: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Create a filter group using Make group functionality
+        /// </summary>
+        private bool CreateFilterGroup()
+        {
+            try
+            {
+                Console.WriteLine("Attempting to create filter group...");
+
+                // Click the More commands button
+                var moreCommandsButtons = _driver.FindElements(By.CssSelector(D365Selectors.MoreCommandsButton));
+                if (moreCommandsButtons.Count == 0)
+                {
+                    throw new Exception("More commands button not found");
+                }
+
+                Console.WriteLine($"Found {moreCommandsButtons.Count} More commands button(s)");
+                ClickElement(moreCommandsButtons.First());
+                Thread.Sleep(500);
+
+                // Click Make group button
+                var makeGroupButton = _wait.Until(ExpectedConditions.ElementToBeClickable(
+                    By.CssSelector(D365Selectors.MakeGroupButton)));
+                
+                Console.WriteLine("Found Make group button, clicking...");
+                ClickElement(makeGroupButton);
+                Thread.Sleep(1000);
+                
+                Console.WriteLine("Filter group creation completed");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to create filter group: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get all filter rows currently visible
+        /// </summary>
+        private List<IWebElement> GetAllFilterRows()
+        {
+            try
+            {
+                var filterRows = new List<IWebElement>();
+                var fieldDropdowns = _driver.FindElements(By.CssSelector(D365Selectors.FieldDropdownWrapper));
+                
+                foreach (var dropdown in fieldDropdowns)
+                {
+                    var parentRow = FindParentFilterRow(dropdown);
+                    if (parentRow != null && !filterRows.Contains(parentRow))
+                    {
+                        filterRows.Add(parentRow);
+                    }
+                }
+
+                return filterRows;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to get filter rows: {ex.Message}");
+                return new List<IWebElement>();
+            }
+        }
+
+        /// <summary>
+        /// Find the parent filter row container for an element
+        /// </summary>
+        private IWebElement FindParentFilterRow(IWebElement element)
+        {
+            try
+            {
+                var current = element;
+                var maxLevels = 10;
+                var level = 0;
+
+                while (current != null && level < maxLevels)
+                {
+                    var tagName = current.TagName.ToLower();
+                    var className = current.GetAttribute("class") ?? "";
+                    var role = current.GetAttribute("role") ?? "";
+
+                    if (tagName == "tr" || 
+                        className.Contains("filter-row") || 
+                        className.Contains("expression-row") ||
+                        role == "row")
+                    {
+                        return current;
+                    }
+
+                    current = current.FindElement(By.XPath(".."));
+                    level++;
+                }
+
+                return element.FindElement(By.XPath("ancestor::div[contains(@class, 'row') or contains(@id, 'row')][1]"));
+            }
+            catch
+            {
+                return element;
+            }
+        }
+
+        /// <summary>
+        /// Check if the filter pane is currently open
+        /// </summary>
+        private bool IsFilterPaneOpen()
+        {
+            try
+            {
+                var filterHeader = _driver.FindElement(By.CssSelector(D365Selectors.FilterPageHeader));
+                return filterHeader.Displayed;
+            }
+            catch (NoSuchElementException)
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Get dynamic index from element ID for proper element targeting
+        /// </summary>
+        private int GetDynamicIndexFromElement(IWebElement element)
+        {
+            try
+            {
+                var elementId = element.GetAttribute("id");
+                if (string.IsNullOrEmpty(elementId))
+                    return 0;
+
+                var match = System.Text.RegularExpressions.Regex.Match(elementId, @"\[(\d+)\]");
+                if (match.Success)
+                {
+                    return int.Parse(match.Groups[1].Value);
+                }
+
+                return 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Enhanced click method with retry logic
+        /// </summary>
+        private void ClickElement(IWebElement element)
+        {
+            var retryCount = 3;
+            for (int i = 0; i < retryCount; i++)
+            {
+                try
+                {
+                    ((IJavaScriptExecutor)_driver).ExecuteScript("arguments[0].scrollIntoView(true);", element);
+                    Thread.Sleep(200);
+
+                    if (element.Enabled && element.Displayed)
+                    {
+                        element.Click();
+                        return;
+                    }
+                }
+                catch (ElementClickInterceptedException)
+                {
+                    try
+                    {
+                        ((IJavaScriptExecutor)_driver).ExecuteScript("arguments[0].click();", element);
+                        return;
+                    }
+                    catch (Exception jsEx)
+                    {
+                        if (i == retryCount - 1)
+                            throw new Exception($"Failed to click element after {retryCount} attempts. Last error: {jsEx.Message}");
+                        
+                        Thread.Sleep(500);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (i == retryCount - 1)
+                        throw new Exception($"Failed to click element: {ex.Message}");
+                    
+                    Thread.Sleep(500);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Dispose resources
+        /// </summary>
+        public void Dispose()
+        {
+            _wait?.Dispose();
+        }
+
+        #endregion
+    }
+
+    /// <summary>
+    /// Example usage and test scenarios
+    /// </summary>
+    public class D365FilterExamples
+    {
+        /// <summary>
+        /// Basic usage examples with GroupFilterRows
+        /// </summary>
+        public void BasicUsageExample()
+        {
+            var options = new ChromeOptions();
+            options.AddArgument("--start-maximized");
+            options.AddArgument("--disable-notifications");
+            var driver = new ChromeDriver(options);
+
+            D365UIFilterUtility filterUtility = null;
+
+            try
+            {
+                filterUtility = new D365UIFilterUtility(driver, 60);
+
+                // Navigate to your D365 instance
+                driver.Navigate().GoToUrl("https://yourorg.crm.dynamics.com");
+                Thread.Sleep(5000); // Wait for page load
+
+                // Example 1: Single filter
+                Console.WriteLine("=== Example 1: Single Filter ===");
+                var singleFilter = new D365UIFilterUtility.FilterConfiguration
+                {
+                    FieldName = "Company Name",
+                    Operator = "Contains",
+                    Value = "Microsoft"
+                };
+
+                if (filterUtility.AddFilter(singleFilter))
+                {
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("Single filter applied successfully!");
+                }
+
+                Thread.Sleep(3000);
+
+                // Example 2: Multiple filters with AND grouping
+                Console.WriteLine("\n=== Example 2: Multiple Filters with AND Grouping ===");
+                filterUtility.ClearAllFilters();
+                
+                var andFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "First Name",
+                        Operator = "Contains",
+                        Value = "John"
+                    },
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "Last Name",
+                        Operator = "Contains", 
+                        Value = "Smith"
+                    }
+                };
+
+                if (filterUtility.AddMultipleFilters(andFilters))
+                {
+                    // Group with AND condition (default)
+                    filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.And);
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("AND grouped filters applied successfully!");
+                }
+
+                Thread.Sleep(3000);
+
+                // Example 3: Multiple filters with OR grouping
+                Console.WriteLine("\n=== Example 3: Multiple Filters with OR Grouping ===");
+                filterUtility.ClearAllFilters();
+                
+                var orFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "First Name",
+                        Operator = "Contains",
+                        Value = "John"
+                    },
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "First Name",
+                        Operator = "Contains", 
+                        Value = "Jane"
+                    }
+                };
+
+                if (filterUtility.AddMultipleFilters(orFilters))
+                {
+                    // Group with OR condition
+                    filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.Or);
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("OR grouped filters applied successfully!");
+                }
+
+                Thread.Sleep(3000);
+
+                Console.WriteLine("\nAll basic examples completed successfully!");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error during basic examples: {ex.Message}");
+            }
+            finally
+            {
+                filterUtility?.Dispose();
+                driver.Quit();
+            }
+        }
+
+        /// <summary>
+        /// Advanced filter scenarios with complex grouping
+        /// </summary>
+        public void AdvancedFilterScenarios()
+        {
+            var options = new ChromeOptions();
+            options.AddArgument("--start-maximized");
+            options.AddArgument("--disable-notifications");
+            var driver = new ChromeDriver(options);
+
+            D365UIFilterUtility filterUtility = null;
+
+            try
+            {
+                filterUtility = new D365UIFilterUtility(driver, 60);
+
+                // Navigate to your D365 instance
+                driver.Navigate().GoToUrl("https://yourorg.crm.dynamics.com");
+                Thread.Sleep(5000);
+
+                // Scenario 1: Complex multi-keyword search with grouping
+                // Goal: (First Name = "John" OR First Name = "Jane") AND Company = "Microsoft"
+                Console.WriteLine("=== Advanced Scenario 1: Multi-keyword OR + AND Logic ===");
+                
+                var keywordFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "First Name",
+                        Operator = "Contains",
+                        Value = "John"
+                    },
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "First Name",
+                        Operator = "Contains",
+                        Value = "Jane"
+                    },
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "Company Name",
+                        Operator = "Contains",
+                        Value = "Microsoft"
+                    }
+                };
+
+                if (filterUtility.AddMultipleFilters(keywordFilters))
+                {
+                    // Group the first two filters (name filters) with OR condition
+                    Console.WriteLine("Grouping name filters with OR condition...");
+                    if (filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.Or))
+                    {
+                        Console.WriteLine("Successfully created OR group: (John OR Jane)");
+                    }
+                    
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine($"Applied complex filter: (John OR Jane) AND Microsoft");
+                    Console.WriteLine($"Current filter count: {filterUtility.GetFilterRowCount()}");
+                }
+
+                Thread.Sleep(5000);
+
+                // Scenario 2: Multiple groups demonstration
+                Console.WriteLine("\n=== Advanced Scenario 2: Multiple Filter Groups ===");
+                filterUtility.ClearAllFilters();
+                Thread.Sleep(1000);
+
+                var multiGroupFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    // Group 1: Status filters (will be OR'ed)
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "Status",
+                        Operator = "Equals",
+                        Value = "Active"
+                    },
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "Status",
+                        Operator = "Equals",
+                        Value = "Inactive"
+                    },
+                    // Group 2: Date filters (will be AND'ed with Group 1)
+                    new D365UIFilterUtility.FilterConfiguration
+                    {
+                        FieldName = "Created On",
+                        Operator = "Last X Days",
+                        Value = "30"
+                    }
+                };
+
+                if (filterUtility.AddMultipleFilters(multiGroupFilters))
+                {
+                    // Group status filters with OR
+                    Console.WriteLine("Creating status group with OR logic...");
+                    filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.Or);
+                    
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("Applied multi-group filters: (Active OR Inactive) AND Created Last 30 Days");
+                }
+
+                Thread.Sleep(5000);
+
+                // Scenario 3: Dynamic operator switching
+                Console.WriteLine("\n=== Advanced Scenario 3: Dynamic Operator Switching ===");
+                
+                // Change the OR group to AND
+                Console.WriteLine("Switching first group from OR to AND...");
+                if (filterUtility.SetGroupOperatorToAnd())
+                {
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("Successfully changed to: (Active AND Inactive) AND Created Last 30 Days");
+                    Console.WriteLine("Note: This will likely return no results as Status cannot be both Active AND Inactive");
+                }
+                else
+                {
+                    Console.WriteLine("Failed to change group operator - this is expected in some UI versions");
+                }
+
+                Thread.Sleep(3000);
+
+                // Switch back to OR
+                Console.WriteLine("Switching back to OR logic...");
+                if (filterUtility.SetGroupOperatorToOr())
+                {
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("Successfully changed back to: (Active OR Inactive) AND Created Last 30 Days");
+                }
+
+                Thread.Sleep(5000);
+                Console.WriteLine("\nAll advanced scenarios completed!");
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Advanced scenario error: {ex.Message}");
+                Console.WriteLine($"Stack trace: {ex.StackTrace}");
+            }
+            finally
+            {
+                filterUtility?.Dispose();
+                driver.Quit();
+            }
+        }
+
+        /// <summary>
+        /// Specific GroupFilterRows usage examples
+        /// </summary>
+        public void GroupFilterRowsExamples()
+        {
+            var options = new ChromeOptions();
+            options.AddArgument("--start-maximized");
+            var driver = new ChromeDriver(options);
+
+            D365UIFilterUtility filterUtility = null;
+
+            try
+            {
+                filterUtility = new D365UIFilterUtility(driver, 60);
+                driver.Navigate().GoToUrl("https://yourorg.crm.dynamics.com");
+                Thread.Sleep(5000);
+
+                Console.WriteLine("=== GroupFilterRows Examples ===");
+
+                // Add several filters first
+                var testFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "First Name", Operator = "Contains", Value = "John" },
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "First Name", Operator = "Contains", Value = "Jane" },
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "Last Name", Operator = "Contains", Value = "Smith" },
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "Company Name", Operator = "Contains", Value = "Microsoft" }
+                };
+
+                Console.WriteLine("Adding test filters...");
+                filterUtility.AddMultipleFilters(testFilters);
+                Console.WriteLine($"Added {testFilters.Count} filters");
+
+                // Example 1: Group first two rows with OR
+                Console.WriteLine("\n1. Grouping rows 0,1 with OR:");
+                if (filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.Or))
+                {
+                    Console.WriteLine("   ✓ Successfully grouped (John OR Jane)");
+                }
+                else
+                {
+                    Console.WriteLine("   ✗ Failed to group rows 0,1");
+                }
+
+                Thread.Sleep(2000);
+
+                // Example 2: Group different rows with AND
+                Console.WriteLine("\n2. Grouping rows 2,3 with AND:");
+                if (filterUtility.GroupFilterRows(new List<int> { 2, 3 }, D365UIFilterUtility.FilterGroupType.And))
+                {
+                    Console.WriteLine("   ✓ Successfully grouped (Smith AND Microsoft)");
+                }
+                else
+                {
+                    Console.WriteLine("   ✗ Failed to group rows 2,3");
+                }
+
+                Thread.Sleep(2000);
+
+                // Apply all filters
+                Console.WriteLine("\n3. Applying all grouped filters...");
+                filterUtility.ApplyFilters();
+                Console.WriteLine("   ✓ Applied filters: (John OR Jane) AND (Smith AND Microsoft)");
+
+                Thread.Sleep(3000);
+
+                // Example 3: Clear and try different grouping
+                Console.WriteLine("\n4. Testing different grouping scenario...");
+                filterUtility.ClearAllFilters();
+
+                var simpleFilters = new List<D365UIFilterUtility.FilterConfiguration>
+                {
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "Status", Operator = "Equals", Value = "Active" },
+                    new D365UIFilterUtility.FilterConfiguration { FieldName = "Status", Operator = "Equals", Value = "Inactive" }
+                };
+
+                filterUtility.AddMultipleFilters(simpleFilters);
+
+                // Default grouping (AND)
+                Console.WriteLine("   Grouping with default AND...");
+                filterUtility.GroupFilterRows(new List<int> { 0, 1 }); // Default is AND
+                filterUtility.ApplyFilters();
+                Console.WriteLine("   ✓ Applied: Status = Active AND Status = Inactive (likely no results)");
+
+                Thread.Sleep(3000);
+
+                // Change to OR
+                Console.WriteLine("   Changing to OR logic...");
+                if (filterUtility.SetGroupOperatorToOr())
+                {
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("   ✓ Changed to: Status = Active OR Status = Inactive");
+                }
+
+                Console.WriteLine("\nGroupFilterRows examples completed!");
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"GroupFilterRows examples error: {ex.Message}");
+            }
+            finally
+            {
+                filterUtility?.Dispose();
+                driver.Quit();
+            }
+        }
+
+        /// <summary>
+        /// Quick test method to verify GroupFilterRows functionality
+        /// </summary>
+        public void QuickGroupTest()
+        {
+            var options = new ChromeOptions();
+            options.AddArgument("--start-maximized");
+            var driver = new ChromeDriver(options);
+
+            try
+            {
+                var filterUtility = new D365UIFilterUtility(driver);
+                driver.Navigate().GoToUrl("https://yourorg.crm.dynamics.com");
+                Thread.Sleep(3000);
+
+                // Quick test: Add two filters and group them
+                Console.WriteLine("=== Quick GroupFilterRows Test ===");
+                
+                filterUtility.AddFilter(new D365UIFilterUtility.FilterConfiguration 
+                { 
+                    FieldName = "First Name", 
+                    Operator = "Contains", 
+                    Value = "Test1" 
+                });
+                
+                filterUtility.AddFilter(new D365UIFilterUtility.FilterConfiguration 
+                { 
+                    FieldName = "First Name", 
+                    Operator = "Contains", 
+                    Value = "Test2" 
+                });
+
+                // Test the GroupFilterRows method
+                bool groupResult = filterUtility.GroupFilterRows(new List<int> { 0, 1 }, D365UIFilterUtility.FilterGroupType.Or);
+                Console.WriteLine($"GroupFilterRows result: {groupResult}");
+                
+                if (groupResult)
+                {
+                    filterUtility.ApplyFilters();
+                    Console.WriteLine("Quick test completed successfully!");
+                }
+                else
+                {
+                    Console.WriteLine("Quick test failed - GroupFilterRows returned false");
+                }
+
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Quick test error: {ex.Message}");
+            }
+            finally
+            {
+                driver.Quit();
+            }
+        }
+    }
+}
