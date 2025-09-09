@@ -1578,3 +1578,184 @@ private bool SetFilterField(IWebElement filterRow, string fieldName, int dynamic
                 return false;
             }
         }
+
+
+private bool SetFilterOperator(IWebElement filterRow, string operatorName, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement operatorDropdown = null;
+                
+                // Method 1: Try to find operator dropdown within the filter row context
+                // Usually the operator is the second ComboBox in the row
+                var dropdownWrappers = filterRow.FindElements(By.CssSelector(D365Selectors.OperatorDropdownWrapper));
+                if (dropdownWrappers.Count >= 2)
+                {
+                    // Skip the first one (field) and take the second one (operator)
+                    operatorDropdown = dropdownWrappers[1];
+                    Console.WriteLine($"Found operator dropdown as second ComboBox in row (Method 1)");
+                }
+                else if (dropdownWrappers.Count == 1)
+                {
+                    // If there's only one, it might be the operator dropdown after field was already set
+                    // Try to identify by looking for operator-specific attributes or position
+                    var singleDropdown = dropdownWrappers[0];
+                    var dropdownId = singleDropdown.GetAttribute("id") ?? "";
+                    
+                    // Check if this looks like an operator dropdown
+                    if (dropdownId.Contains("operator") || 
+                        singleDropdown.GetAttribute("aria-label")?.Contains("operator", StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        operatorDropdown = singleDropdown;
+                        Console.WriteLine($"Found operator dropdown by attributes (Method 1b)");
+                    }
+                }
+
+                // Method 2: Try finding operator by looking for specific operator index if provided
+                if (operatorDropdown == null && dynamicIndex > 0)
+                {
+                    // Try different index patterns that might be used for operators
+                    var operatorIndexPatterns = new[]
+                    {
+                        dynamicIndex + 1,  // Operator might be field index + 1
+                        dynamicIndex * 2,  // Or double the field index
+                        dynamicIndex,      // Or same as field index but different element type
+                    };
+
+                    foreach (var opIndex in operatorIndexPatterns)
+                    {
+                        var specificOperatorSelector = string.Format(D365Selectors.OperatorDropdownByIndex, opIndex);
+                        try
+                        {
+                            operatorDropdown = _driver.FindElement(By.CssSelector(specificOperatorSelector));
+                            Console.WriteLine($"Found operator dropdown using index {opIndex} (Method 2)");
+                            break;
+                        }
+                        catch (NoSuchElementException) 
+                        { 
+                            // Continue to next pattern
+                        }
+                    }
+                }
+
+                // Method 3: Try to find by looking for operator input element first
+                if (operatorDropdown == null)
+                {
+                    try
+                    {
+                        var operatorInputs = filterRow.FindElements(By.CssSelector(D365Selectors.OperatorInput));
+                        if (operatorInputs.Count >= 2)
+                        {
+                            // Take the second input (first is field, second is operator)
+                            var operatorInput = operatorInputs[1];
+                            operatorDropdown = operatorInput.FindElement(By.XPath("ancestor::div[contains(@id, 'ComboBox') and contains(@id, 'wrapper')][1]"));
+                            Console.WriteLine($"Found operator dropdown via second input element (Method 3)");
+                        }
+                        else if (operatorInputs.Count == 1)
+                        {
+                            // Check if this single input might be the operator
+                            var singleInput = operatorInputs[0];
+                            var inputId = singleInput.GetAttribute("id") ?? "";
+                            if (inputId.Contains("operator") || 
+                                singleInput.GetAttribute("aria-label")?.Contains("operator", StringComparison.OrdinalIgnoreCase) == true)
+                            {
+                                operatorDropdown = singleInput.FindElement(By.XPath("ancestor::div[contains(@id, 'ComboBox') and contains(@id, 'wrapper')][1]"));
+                                Console.WriteLine($"Found operator dropdown via operator input (Method 3b)");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Method 3 failed: {ex.Message}");
+                    }
+                }
+
+                // Method 4: Fallback - look for any ComboBox that might be an operator dropdown
+                if (operatorDropdown == null)
+                {
+                    // Look for ComboBoxes in the entire filter pane that might be operator dropdowns
+                    var allComboBoxes = _driver.FindElements(By.CssSelector(D365Selectors.OperatorDropdownWrapper));
+                    foreach (var combo in allComboBoxes)
+                    {
+                        var comboId = combo.GetAttribute("id") ?? "";
+                        var ariaLabel = combo.GetAttribute("aria-label") ?? "";
+                        
+                        if (comboId.Contains("operator", StringComparison.OrdinalIgnoreCase) ||
+                            ariaLabel.Contains("operator", StringComparison.OrdinalIgnoreCase) ||
+                            comboId.Contains("condition", StringComparison.OrdinalIgnoreCase))
+                        {
+                            operatorDropdown = combo;
+                            Console.WriteLine($"Found operator dropdown by searching all ComboBoxes (Method 4)");
+                            break;
+                        }
+                    }
+                }
+
+                if (operatorDropdown == null)
+                {
+                    throw new NoSuchElementException("Operator dropdown not found using any method");
+                }
+
+                ClickElement(operatorDropdown);
+                Thread.Sleep(500);
+
+                var operatorOptions = _driver.FindElements(By.CssSelector("div[role='option'], li[role='option']"));
+                var operatorOption = operatorOptions.FirstOrDefault(o =>
+                    o.Text.Equals(operatorName, StringComparison.OrdinalIgnoreCase) ||
+                    o.Text.Contains(operatorName, StringComparison.OrdinalIgnoreCase));
+
+                if (operatorOption != null)
+                {
+                    ClickElement(operatorOption);
+                    Console.WriteLine($"Successfully set operator to: {operatorName}");
+                    return true;
+                }
+
+                throw new Exception($"Operator '{operatorName}' not found in dropdown options");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter operator: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Set the value for a filter row with dynamic index
+        /// </summary>
+        private bool SetFilterValue(IWebElement filterRow, string value, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement valueInput = null;
+                
+                if (dynamicIndex > 0)
+                {
+                    var specificSelector = string.Format(D365Selectors.ValueInputByIndex, dynamicIndex);
+                    try
+                    {
+                        valueInput = _driver.FindElement(By.CssSelector(specificSelector));
+                    }
+                    catch (NoSuchElementException) { }
+                }
+
+                if (valueInput == null)
+                {
+                    valueInput = filterRow.FindElement(By.CssSelector(D365Selectors.ValueInput));
+                }
+
+                if (valueInput != null)
+                {
+                    valueInput.Clear();
+                    valueInput.SendKeys(value);
+                    return true;
+                }
+
+                return false;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter value: {ex.Message}");
+                return false;
+            }
+        }
