@@ -1389,3 +1389,104 @@ namespace Dynamics365UIFilterAutomation
         }
     }
 }
+
+
+/// <summary>
+/// Adds a new empty filter row
+/// </summary>
+public bool AddRow()
+{
+    try
+    {
+        if (!IsFilterPaneOpen())
+        {
+            if (!OpenEditFiltersPane())
+                return false;
+        }
+
+        var initialRowCount = GetFilterRowCount();
+
+        // Click Add Filter button
+        var addFilterButton = _wait.Until(ExpectedConditions.ElementToBeClickable(
+            By.CssSelector(D365Selectors.AddFilterButton)));
+        ClickElement(addFilterButton);
+
+        Thread.Sleep(1000); // Wait for new filter row
+
+        // Verify new row was added
+        var newRowCount = GetFilterRowCount();
+        if (newRowCount <= initialRowCount)
+        {
+            throw new Exception("Failed to create new filter row");
+        }
+
+        Console.WriteLine("New filter row added successfully");
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to add new filter row: {ex.Message}");
+        return false;
+    }
+}
+
+
+
+
+public bool AddFilter(FilterConfiguration config)
+{
+    try
+    {
+        if (!AddRow())
+            return false;
+
+        var filterRows = GetAllFilterRows();
+        if (filterRows.Count == 0)
+        {
+            throw new Exception("No filter rows found after adding filter");
+        }
+
+        var newFilterRow = filterRows.LastOrDefault();
+        return ConfigureFilterRow(newFilterRow, config);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to add filter: {ex.Message}");
+        return false;
+    }
+}
+
+public bool AddMultipleFilters(List<FilterConfiguration> filters)
+{
+    try
+    {
+        if (!OpenEditFiltersPane())
+            return false;
+
+        ClearAllFilters();
+
+        foreach (var filter in filters)
+        {
+            if (!AddRow())
+            {
+                Console.WriteLine($"Failed to add row for filter: {filter.FieldName}");
+                continue;
+            }
+
+            var filterRows = GetAllFilterRows();
+            var newFilterRow = filterRows.LastOrDefault();
+            if (!ConfigureFilterRow(newFilterRow, filter))
+            {
+                Console.WriteLine($"Failed to configure filter: {filter.FieldName}");
+            }
+            Thread.Sleep(500);
+        }
+
+        return true;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Failed to add multiple filters: {ex.Message}");
+        return false;
+    }
+}
