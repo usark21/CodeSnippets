@@ -1490,3 +1490,91 @@ public bool AddMultipleFilters(List<FilterConfiguration> filters)
         return false;
     }
 }
+
+
+private bool SetFilterField(IWebElement filterRow, string fieldName, int dynamicIndex)
+        {
+            try
+            {
+                IWebElement fieldDropdown = null;
+                
+                // Method 1: Try to find field dropdown within the filter row context
+                var fieldDropdowns = filterRow.FindElements(By.CssSelector(D365Selectors.FieldDropdownWrapper));
+                if (fieldDropdowns.Count > 0)
+                {
+                    // Usually the first ComboBox wrapper in a row is the field dropdown
+                    fieldDropdown = fieldDropdowns.First();
+                    Console.WriteLine($"Found field dropdown using row context (Method 1)");
+                }
+
+                // Method 2: If not found, try by specific index if provided
+                if (fieldDropdown == null && dynamicIndex > 0)
+                {
+                    var specificFieldSelector = string.Format(D365Selectors.FieldDropdownByIndex, dynamicIndex);
+                    try
+                    {
+                        fieldDropdown = _driver.FindElement(By.CssSelector(specificFieldSelector));
+                        Console.WriteLine($"Found field dropdown using index {dynamicIndex} (Method 2)");
+                    }
+                    catch (NoSuchElementException) 
+                    { 
+                        Console.WriteLine($"Field dropdown not found with index {dynamicIndex}");
+                    }
+                }
+
+                // Method 3: Try to find by looking for the input element first, then get its wrapper
+                if (fieldDropdown == null)
+                {
+                    try
+                    {
+                        var fieldInputs = filterRow.FindElements(By.CssSelector(D365Selectors.FieldInput));
+                        if (fieldInputs.Count > 0)
+                        {
+                            // Navigate up from the input to find the wrapper
+                            var fieldInput = fieldInputs.First();
+                            fieldDropdown = fieldInput.FindElement(By.XPath("ancestor::div[contains(@id, 'ComboBox') and contains(@id, 'wrapper')][1]"));
+                            Console.WriteLine($"Found field dropdown via input element (Method 3)");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Method 3 failed: {ex.Message}");
+                    }
+                }
+
+                if (fieldDropdown == null)
+                {
+                    throw new NoSuchElementException("Field dropdown not found using any method");
+                }
+
+                ClickElement(fieldDropdown);
+                Thread.Sleep(1000);
+
+                // Find and click the field option
+                var fieldOptions = _driver.FindElements(By.CssSelector("div[role='option'], li[role='option']"));
+                var fieldOption = fieldOptions.FirstOrDefault(o => 
+                    o.Text.Contains(fieldName, StringComparison.OrdinalIgnoreCase));
+
+                if (fieldOption == null)
+                {
+                    fieldOption = fieldOptions.FirstOrDefault(o =>
+                        o.GetAttribute("data-value")?.Contains(fieldName, StringComparison.OrdinalIgnoreCase) == true ||
+                        o.GetAttribute("title")?.Contains(fieldName, StringComparison.OrdinalIgnoreCase) == true ||
+                        o.GetAttribute("aria-label")?.Contains(fieldName, StringComparison.OrdinalIgnoreCase) == true);
+                }
+
+                if (fieldOption != null)
+                {
+                    ClickElement(fieldOption);
+                    Console.WriteLine($"Successfully set field to: {fieldName}");
+                    return true;
+                }
+
+                throw new Exception($"Field '{fieldName}' not found in dropdown options");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Failed to set filter field: {ex.Message}");
+                return false;
+            }
+        }
